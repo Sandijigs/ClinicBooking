@@ -185,6 +185,34 @@ app.get("/bookings/:id", async (req, res) => {
   res.json(formatBooking(result.rows[0]));
 });
 
+// ---------- DELETE /bookings/:id (Level 3) ----------
+
+app.delete("/bookings/:id", async (req, res) => {
+  const { id } = req.params;
+  if (!UUID_PATTERN.test(id)) {
+    return res.status(404).json({ error: "booking not found" });
+  }
+
+  // Cancel only if it's currently confirmed (one atomic step)
+  const result = await pool.query(
+    `UPDATE bookings SET status = 'cancelled'
+     WHERE id = $1 AND status = 'confirmed'
+     RETURNING *`,
+    [id]
+  );
+
+  if (result.rows.length > 0) {
+    return res.status(200).json(formatBooking(result.rows[0]));
+  }
+
+  // Nothing was updated: find out why
+  const existing = await pool.query("SELECT status FROM bookings WHERE id = $1", [id]);
+  if (existing.rows.length === 0) {
+    return res.status(404).json({ error: "booking not found" });
+  }
+  return res.status(409).json({ error: "booking already cancelled" });
+});
+
 // ---------- React app (production) ----------
 
 const clientDist = path.join(__dirname, "..", "client", "dist");
