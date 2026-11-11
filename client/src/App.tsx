@@ -1,122 +1,112 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import './App.css'
+import { useCallback, useEffect, useState } from "react";
+import "./App.css";
+import { getSlots } from "./api";
+import type { Booking, Slot } from "./api";
+import { SlotList } from "./components/SlotList";
+import { BookingForm } from "./components/BookingForm";
+import { Confirmation } from "./components/Confirmation";
+import { MyBookings } from "./components/MyBookings";
 
-function App() {
-  const [count, setCount] = useState(0)
+type View =
+  | { name: "slots" }
+  | { name: "book"; slot: Slot }
+  | { name: "confirmed"; slot: Slot; booking: Booking };
+
+export default function App() {
+  const [view, setView] = useState<View>({ name: "slots" });
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [provider, setProvider] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadSlots = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setSlots(await getSlots());
+    } catch {
+      setError("We couldn't load the appointment slots. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSlots();
+  }, [loadSlots]);
+
+  const providers = [...new Set(slots.map((s) => s.provider))].sort();
+  const visibleSlots = provider ? slots.filter((s) => s.provider === provider) : slots;
+
+  function backToSlots() {
+    setView({ name: "slots" });
+    loadSlots(); // availability may have changed
+  }
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
+    <div className="page">
+      <header className="header">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">+</span>
+          <span>Clinic Booking</span>
         </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+        <p className="tagline">Pick a time that suits you and book in seconds.</p>
+      </header>
 
-      <div className="ticks"></div>
+      <main className="main">
+        {view.name === "slots" && (
+          <section className="card">
+            <div className="card-head">
+              <h2>Available appointments</h2>
+              <div className="toolbar">
+                {providers.length > 1 && (
+                  <select
+                    value={provider}
+                    onChange={(e) => setProvider(e.target.value)}
+                    aria-label="Filter by doctor"
+                  >
+                    <option value="">All doctors</option>
+                    {providers.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <button type="button" className="secondary" onClick={loadSlots} disabled={loading}>
+                  Refresh
+                </button>
+              </div>
+            </div>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+            {loading && <p className="empty">Loading slots…</p>}
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+            {!loading && !error && (
+              <SlotList slots={visibleSlots} onSelect={(slot) => setView({ name: "book", slot })} />
+            )}
+          </section>
+        )}
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+        {view.name === "book" && (
+          <BookingForm
+            slot={view.slot}
+            onBack={backToSlots}
+            onBooked={(booking) => setView({ name: "confirmed", slot: view.slot, booking })}
+          />
+        )}
+
+        {view.name === "confirmed" && (
+          <Confirmation booking={view.booking} slot={view.slot} onDone={backToSlots} />
+        )}
+
+        {view.name === "slots" && <MyBookings />}
+      </main>
+
+      <footer className="footer">Clinic Booking · Koya assessment</footer>
+    </div>
+  );
 }
-
-export default App

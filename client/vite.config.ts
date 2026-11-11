@@ -6,8 +6,8 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
+        // The Express server handles /api itself and adds the API key
         target: "http://localhost:3000",
-        rewrite: (path) => path.replace(/^\/api/, ""),
       },
     },
   },

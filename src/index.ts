@@ -55,6 +55,32 @@ function requireApiKey(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+// ---------- Web page bridge: /api/... (used by the React page) ----------
+// The browser can't hold the API key safely, so the page calls /api/...
+// and the server adds the key itself before handing the request on.
+// Only the routes the page needs are allowed; /reset is never reachable this way.
+
+const PAGE_ROUTES: Array<[string, RegExp]> = [
+  ["GET", /^\/slots$/],
+  ["GET", /^\/bookings$/],
+  ["POST", /^\/bookings$/],
+  ["GET", /^\/bookings\/[^/]+$/],
+  ["DELETE", /^\/bookings\/[^/]+$/],
+];
+
+app.use((req, res, next) => {
+  if (req.path !== "/api" && !req.path.startsWith("/api/")) return next();
+
+  const routePath = req.path.slice("/api".length); // /api/slots -> /slots
+  const allowed = PAGE_ROUTES.some(([method, pattern]) => req.method === method && pattern.test(routePath));
+  if (!allowed) {
+    return res.status(404).json({ error: "not found" });
+  }
+  req.headers["x-api-key"] = API_KEY;
+  req.url = req.url.slice("/api".length); // keeps the ?query part too
+  next();
+});
+
 // ---------- Public route ----------
 
 app.get("/health", async (_req, res) => {
