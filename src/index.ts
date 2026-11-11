@@ -79,6 +79,7 @@ app.post("/reset", async (req, res) => {
     await client.query("DELETE FROM bookings");
     await client.query("DELETE FROM slots");
     await client.query("DELETE FROM idempotency_keys");
+    await client.query("DELETE FROM rate_limit_attempts");
     for (const slot of slots) {
       await client.query(
         "INSERT INTO slots (id, provider, start_at, end_at) VALUES ($1, $2, $3, $4)",
@@ -163,7 +164,63 @@ async function createBooking(body: any): Promise<Outcome> {
   }
 }
 
+// ---------- Rate limiting (Level 5) ----------
+
+const RATE_LIMIT = 5;
+
+type RateLimitResult = { allowed: true } | { allowed: false; retryAfter: number };
+
+// Allows at most 5 attempts per email in any 60-second window
+async function checkRateLimit(email: string): Promise<RateLimitResult> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // One request per email at a time, so simultaneous requests can't all slip through
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [email]);
+
+    // Forget attempts older than one minute
+    await client.query(
+      "DELETE FROM rate_limit_attempts WHERE email = $1 AND attempted_at <= now() - interval '1 minute'",
+      [email]
+    );
+
+    const recent = await client.query(
+      `SELECT count(*)::int AS attempts,
+              CEIL(EXTRACT(EPOCH FROM (min(attempted_at) + interval '1 minute' - now())))::int AS retry_after
+       FROM rate_limit_attempts WHERE email = $1`,
+      [email]
+    );
+    const { attempts, retry_after } = recent.rows[0];
+
+    if (attempts >= RATE_LIMIT) {
+      await client.query("COMMIT");
+      return { allowed: false, retryAfter: Math.max(1, retry_after) };
+    }
+
+    await client.query("INSERT INTO rate_limit_attempts (email) VALUES ($1)", [email]);
+    await client.query("COMMIT");
+    return { allowed: true };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 app.post("/bookings", async (req, res) => {
+  // Level 5: count this attempt before anything else, so failed attempts count too
+  const attemptEmail =
+    typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (attemptEmail) {
+    const limit = await checkRateLimit(attemptEmail);
+    if (!limit.allowed) {
+      res.set("Retry-After", String(limit.retryAfter));
+      return res.status(429).json({ error: "too many booking attempts for this email, try again later" });
+    }
+  }
+
   const key = req.header("Idempotency-Key");
 
   // No key: just book (Levels 1-3 behaviour)

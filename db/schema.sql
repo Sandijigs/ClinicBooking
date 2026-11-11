@@ -37,3 +37,12 @@ ALTER TABLE idempotency_keys ALTER COLUMN response_body TYPE TEXT;
 -- Level 4: fast lookup of one person's bookings in date order
 CREATE INDEX IF NOT EXISTS bookings_by_email
   ON bookings (email, created_at, id);
+
+-- Level 5: one row per booking attempt, for rate limiting
+CREATE TABLE IF NOT EXISTS rate_limit_attempts (
+  email         TEXT NOT NULL,
+  attempted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS rate_limit_by_email
+  ON rate_limit_attempts (email, attempted_at);
