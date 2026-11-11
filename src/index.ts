@@ -12,6 +12,13 @@ const API_KEY = process.env.API_KEY ?? "";
 
 // ---------- Helpers ----------
 
+// A fingerprint of the request body, used to spot "same key, different body"
+function hashBody(body: unknown): string {
+  return crypto.createHash("sha256").update(JSON.stringify(body ?? null)).digest("hex");
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function toIso(date: Date): string {
   return date.toISOString().replace(".000Z", "Z");
 }
@@ -71,6 +78,7 @@ app.post("/reset", async (req, res) => {
     await client.query("BEGIN");
     await client.query("DELETE FROM bookings");
     await client.query("DELETE FROM slots");
+    await client.query("DELETE FROM idempotency_keys");
     for (const slot of slots) {
       await client.query(
         "INSERT INTO slots (id, provider, start_at, end_at) VALUES ($1, $2, $3, $4)",
@@ -121,53 +129,144 @@ app.get("/slots", async (req, res) => {
 
 // ---------- POST /bookings ----------
 
-app.post("/bookings", async (req, res) => {
-  const body = req.body ?? {};
+type Outcome = { status: number; body: unknown };
 
-  // 1. Every field must be a non-empty string (after trimming)
+// The booking logic from Levels 1-3, returning an outcome instead of sending it
+async function createBooking(body: any): Promise<Outcome> {
+  body = body ?? {};
   const slotId = typeof body.slot_id === "string" ? body.slot_id.trim() : "";
   const name = typeof body.name === "string" ? body.name.trim() : "";
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
 
-  if (!slotId) return res.status(400).json({ error: "slot_id is required" });
-  if (!name) return res.status(400).json({ error: "name is required" });
-  if (!email) return res.status(400).json({ error: "email is required" });
+  if (!slotId) return { status: 400, body: { error: "slot_id is required" } };
+  if (!name) return { status: 400, body: { error: "name is required" } };
+  if (!email) return { status: 400, body: { error: "email is required" } };
+  if (!EMAIL_PATTERN.test(email)) return { status: 400, body: { error: "email is not valid" } };
 
-  // 2. Email must look like an email
-  if (!EMAIL_PATTERN.test(email)) {
-    return res.status(400).json({ error: "email is not valid" });
-  }
-
-  // 3. The slot must exist and must not have started yet
   const slotResult = await pool.query(
     "SELECT start_at <= now() AS started FROM slots WHERE id = $1",
     [slotId]
   );
-  if (slotResult.rows.length === 0) {
-    return res.status(404).json({ error: "slot not found" });
-  }
-  if (slotResult.rows[0].started) {
-    return res.status(400).json({ error: "slot has already started" });
-  }
+  if (slotResult.rows.length === 0) return { status: 404, body: { error: "slot not found" } };
+  if (slotResult.rows[0].started) return { status: 400, body: { error: "slot has already started" } };
 
-  // 4. Create the booking (the unique index still blocks double booking)
   try {
     const result = await pool.query(
-      `INSERT INTO bookings (slot_id, name, email)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
+      `INSERT INTO bookings (slot_id, name, email) VALUES ($1, $2, $3) RETURNING *`,
       [slotId, name, email]
     );
-    res.status(201).json(formatBooking(result.rows[0]));
+    return { status: 201, body: formatBooking(result.rows[0]) };
   } catch (err: any) {
-    if (err.code === "23503") {
-      return res.status(404).json({ error: "slot not found" });
-    }
-    if (err.code === "23505") {
-      return res.status(409).json({ error: "slot already booked" });
-    }
+    if (err.code === "23503") return { status: 404, body: { error: "slot not found" } };
+    if (err.code === "23505") return { status: 409, body: { error: "slot already booked" } };
     throw err;
   }
+}
+
+app.post("/bookings", async (req, res) => {
+  const key = req.header("Idempotency-Key");
+
+  // No key: just book (Levels 1-3 behaviour)
+  if (!key) {
+    const outcome = await createBooking(req.body);
+    return res.status(outcome.status).json(outcome.body);
+  }
+
+  const requestHash = hashBody(req.body);
+
+  // Try to claim the key. Only one request can insert it.
+  const claim = await pool.query(
+    `INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2)
+     ON CONFLICT (key) DO NOTHING
+     RETURNING key`,
+    [key, requestHash]
+  );
+
+  if (claim.rows.length === 1) {
+    // We own the key: do the real work, then record the response
+    try {
+      const outcome = await createBooking(req.body);
+      await pool.query(
+        "UPDATE idempotency_keys SET response_status = $2, response_body = $3 WHERE key = $1",
+        [key, outcome.status, JSON.stringify(outcome.body)]
+      );
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      // Something unexpected broke: release the key so a retry can try again
+      await pool.query("DELETE FROM idempotency_keys WHERE key = $1", [key]);
+      throw err;
+    }
+  }
+
+  // The key was already used: replay the stored response (waiting if it's still in progress)
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const stored = await pool.query(
+      "SELECT request_hash, response_status, response_body FROM idempotency_keys WHERE key = $1",
+      [key]
+    );
+    const row = stored.rows[0];
+
+    if (!row) break; // the first request failed and released the key
+    if (row.request_hash !== requestHash) {
+      return res.status(422).json({ error: "Idempotency-Key was already used with a different request body" });
+    }
+    if (row.response_status !== null) {
+      // Send the stored text exactly as it was first sent
+      return res.status(row.response_status).type("application/json").send(row.response_body);
+    }
+    await sleep(100); // first request still working: wait and check again
+  }
+
+  return res.status(409).json({ error: "a request with this Idempotency-Key is still being processed" });
+});
+
+// ---------- GET /bookings: a person's bookings, paginated (Level 4) ----------
+
+app.get("/bookings", async (req, res) => {
+  const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+  if (!email) return res.status(400).json({ error: "email is required" });
+
+  // limit: whole number from 1 to 50, default 10
+  let limit = 10;
+  if (req.query.limit !== undefined) {
+    const raw = String(req.query.limit);
+    if (!/^\d+$/.test(raw) || Number(raw) < 1 || Number(raw) > 50) {
+      return res.status(400).json({ error: "limit must be a whole number from 1 to 50" });
+    }
+    limit = Number(raw);
+  }
+
+  const params: unknown[] = [email];
+  let sql = "SELECT * FROM bookings WHERE email = $1";
+
+  // cursor: the id of the last booking on the previous page
+  const cursor = req.query.cursor;
+  if (cursor !== undefined) {
+    if (typeof cursor !== "string" || !UUID_PATTERN.test(cursor)) {
+      return res.status(400).json({ error: "cursor is not valid" });
+    }
+    const anchor = await pool.query(
+      "SELECT 1 FROM bookings WHERE id = $1 AND email = $2",
+      [cursor, email]
+    );
+    if (anchor.rows.length === 0) {
+      return res.status(400).json({ error: "cursor is not valid" });
+    }
+    params.push(cursor);
+    sql += ` AND (created_at, id) > (SELECT created_at, id FROM bookings WHERE id = $${params.length})`;
+  }
+
+  params.push(limit + 1);
+  sql += ` ORDER BY created_at ASC, id ASC LIMIT $${params.length}`;
+
+  const result = await pool.query(sql, params);
+  const hasMore = result.rows.length > limit;
+  const page = result.rows.slice(0, limit);
+
+  res.json({
+    bookings: page.map(formatBooking),
+    next_cursor: hasMore ? page[page.length - 1].id : null,
+  });
 });
 
 // ---------- GET /bookings/:id ----------

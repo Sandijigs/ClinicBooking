@@ -20,3 +20,20 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_booking_per_slot
   ON bookings (slot_id)
   WHERE status = 'confirmed';
+
+-- Level 4: remembers each Idempotency-Key and the response it got
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key              TEXT PRIMARY KEY,
+  request_hash     TEXT NOT NULL,
+  response_status  INTEGER,
+  response_body    TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Keep the stored response as plain text so it's replayed byte-for-byte
+-- (JSONB would reorder the fields). Safe to run again.
+ALTER TABLE idempotency_keys ALTER COLUMN response_body TYPE TEXT;
+
+-- Level 4: fast lookup of one person's bookings in date order
+CREATE INDEX IF NOT EXISTS bookings_by_email
+  ON bookings (email, created_at, id);
